@@ -1,13 +1,13 @@
 plugins {
-    alias(libs.plugins.android.library)
-    alias(libs.plugins.jetbrains.kotlin.android)
+    id("com.android.library")
+    id("org.jetbrains.kotlin.android")
 }
 
 android {
     namespace = "com.arm.aichat"
     compileSdk = 36
 
-    ndkVersion = "29.0.13113456"
+    ndkVersion = "28.2.13676358"
 
     defaultConfig {
         minSdk = 33
@@ -16,7 +16,7 @@ android {
         consumerProguardFiles("consumer-rules.pro")
 
         ndk {
-             abiFilters += listOf("arm64-v8a", "x86_64")
+            abiFilters += listOf("arm64-v8a")
         }
         externalNativeBuild {
             cmake {
@@ -41,7 +41,7 @@ android {
     externalNativeBuild {
         cmake {
             path("src/main/cpp/CMakeLists.txt")
-            version = "3.31.6"
+            version = "3.22.1"
         }
     }
     compileOptions {
@@ -62,17 +62,10 @@ android {
         }
     }
 
-    publishing {
-        singleVariant("release") {
-            withJavadocJar()
-        }
-    }
 }
 
 dependencies {
-    implementation(libs.androidx.core.ktx)
-    implementation(libs.androidx.datastore.preferences)
-
-    testImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.junit)
+    implementation("androidx.core:core-ktx:1.18.0")
+    implementation("androidx.datastore:datastore-preferences:1.2.0")
+    testImplementation("junit:junit:4.13.2")
 }

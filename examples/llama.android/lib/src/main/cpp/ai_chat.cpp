@@ -73,16 +73,26 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     return 0;
 }
 
-static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT_CONTEXT_SIZE) {
+static int resolve_thread_count(const int requested_thread_count) {
+    if (requested_thread_count > 0) {
+        return std::max(1, std::min(N_THREADS_MAX, requested_thread_count));
+    }
+    return std::max(N_THREADS_MIN, std::min(N_THREADS_MAX,
+                                            (int) sysconf(_SC_NPROCESSORS_ONLN) -
+                                            N_THREADS_HEADROOM));
+}
+
+static llama_context *init_context(
+        llama_model *model,
+        const int n_ctx = DEFAULT_CONTEXT_SIZE,
+        const int requested_thread_count = 0) {
     if (!model) {
         LOGe("%s: model cannot be null", __func__);
         return nullptr;
     }
 
     // Multi-threading setup
-    const int n_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX,
-                                                     (int) sysconf(_SC_NPROCESSORS_ONLN) -
-                                                     N_THREADS_HEADROOM));
+    const int n_threads = resolve_thread_count(requested_thread_count);
     LOGi("%s: Using %d threads", __func__, n_threads);
 
     // Context parameters setup
@@ -112,8 +122,11 @@ static common_sampler *new_sampler(float temp) {
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv * /*env*/, jobject /*unused*/) {
-    auto *context = init_context(g_model);
+Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(
+        JNIEnv * /*env*/,
+        jobject /*unused*/,
+        jint requested_thread_count) {
+    auto *context = init_context(g_model, DEFAULT_CONTEXT_SIZE, requested_thread_count);
     if (!context) { return 1; }
     g_context = context;
     g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
@@ -311,6 +324,9 @@ static void reset_short_term_states() {
     stop_generation_position = 0;
     cached_token_chars.clear();
     assistant_ss.str("");
+    if (g_sampler) {
+        common_sampler_reset(g_sampler);
+    }
 }
 
 static int decode_tokens_in_batches(
@@ -401,6 +417,28 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
 
 extern "C"
 JNIEXPORT jint JNICALL
+Java_com_arm_aichat_internal_InferenceEngineImpl_restoreSystemPromptContext(
+        JNIEnv * /*env*/,
+        jobject /*unused*/
+) {
+    if (!g_context || system_prompt_position <= 0 || current_position < system_prompt_position) {
+        LOGe("%s: No valid system prompt context to restore", __func__);
+        return 1;
+    }
+
+    reset_short_term_states();
+    if (current_position > system_prompt_position) {
+        llama_memory_seq_rm(llama_get_memory(g_context), 0, system_prompt_position, current_position);
+    }
+    if (chat_msgs.size() > 1) {
+        chat_msgs.resize(1);
+    }
+    current_position = system_prompt_position;
+    return 0;
+}
+
+extern "C"
+JNIEXPORT jint JNICALL
 Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
         JNIEnv *env,
         jobject /*unused*/,
@@ -429,13 +467,18 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Ensure user prompt doesn't exceed the context size by truncating if necessary.
-    const int user_prompt_size = (int) user_tokens.size();
-    const int max_batch_size = DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM;
-    if (user_prompt_size > max_batch_size) {
-        const int skipped_tokens = user_prompt_size - max_batch_size;
+    const int original_user_prompt_size = (int) user_tokens.size();
+    const int max_batch_size = DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM - current_position;
+    if (max_batch_size <= 0) {
+        LOGe("%s: User prompt cannot fit into remaining context!", __func__);
+        return 1;
+    }
+    if (original_user_prompt_size > max_batch_size) {
+        const int skipped_tokens = original_user_prompt_size - max_batch_size;
         user_tokens.resize(max_batch_size);
         LOGw("%s: User prompt too long! Skipped %d tokens!", __func__, skipped_tokens);
     }
+    const int decoded_user_prompt_size = (int) user_tokens.size();
 
     // Decode user tokens in batches
     if (decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true)) {
@@ -444,8 +487,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Update position
-    current_position += user_prompt_size;
-    stop_generation_position = current_position + user_prompt_size + n_predict;
+    current_position += decoded_user_prompt_size;
+    stop_generation_position = current_position + n_predict;
     return 0;
 }
 

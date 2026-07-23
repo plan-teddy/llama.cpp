@@ -18,7 +18,7 @@ interface InferenceEngine {
      *
      * @throws UnsupportedArchitectureException if model architecture not supported
      */
-    suspend fun loadModel(pathToModel: String)
+    suspend fun loadModel(pathToModel: String, threadCount: Int = 0)
 
     /**
      * Sends a system prompt to the loaded model
@@ -26,9 +26,30 @@ interface InferenceEngine {
     suspend fun setSystemPrompt(systemPrompt: String)
 
     /**
+     * Drops user/assistant context while preserving the already processed system prompt.
+     */
+    suspend fun resetToSystemPrompt()
+
+    /**
      * Sends a user prompt to the loaded model and returns a Flow of generated tokens.
      */
     fun sendUserPrompt(message: String, predictLength: Int = DEFAULT_PREDICT_LENGTH): Flow<String>
+
+    /**
+     * Runs a user prompt on the engine dispatcher without a Flow bridge.
+     *
+     * Returning false from [onToken] requests generation to stop after the current token.
+     */
+    suspend fun runPrompt(
+        message: String,
+        predictLength: Int = DEFAULT_PREDICT_LENGTH,
+        onToken: suspend (String) -> Boolean,
+    )
+
+    /**
+     * Requests the current generation loop to stop after the in-flight native token finishes.
+     */
+    fun requestGenerationStop()
 
     /**
      * Runs a benchmark with the specified parameters.

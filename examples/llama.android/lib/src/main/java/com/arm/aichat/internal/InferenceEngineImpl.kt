@@ -86,7 +86,7 @@ internal class InferenceEngineImpl private constructor(
     private external fun load(modelPath: String): Int
 
     @FastNative
-    private external fun prepare(): Int
+    private external fun prepare(threadCount: Int): Int
 
     @FastNative
     private external fun systemInfo(): String
@@ -96,6 +96,9 @@ internal class InferenceEngineImpl private constructor(
 
     @FastNative
     private external fun processSystemPrompt(systemPrompt: String): Int
+
+    @FastNative
+    private external fun restoreSystemPromptContext(): Int
 
     @FastNative
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
@@ -147,7 +150,7 @@ internal class InferenceEngineImpl private constructor(
     /**
      * Load the LLM
      */
-    override suspend fun loadModel(pathToModel: String) =
+    override suspend fun loadModel(pathToModel: String, threadCount: Int) =
         withContext(llamaDispatcher) {
             check(_state.value is InferenceEngine.State.Initialized) {
                 "Cannot load model in ${_state.value.javaClass.simpleName}!"
@@ -168,7 +171,7 @@ internal class InferenceEngineImpl private constructor(
                     // TODO-han.yin: find a better way to pass other error codes
                     if (it != 0) throw UnsupportedArchitectureException()
                 }
-                prepare().let {
+                prepare(threadCount).let {
                     if (it != 0) throw IOException("Failed to prepare resources")
                 }
                 Log.i(TAG, "Model loaded!")
@@ -188,10 +191,9 @@ internal class InferenceEngineImpl private constructor(
      *
      * TODO-han.yin: return error code if system prompt not correct processed?
      */
-    override suspend fun setSystemPrompt(prompt: String) =
+    override suspend fun setSystemPrompt(systemPrompt: String) =
         withContext(llamaDispatcher) {
-            require(prompt.isNotBlank()) { "Cannot process empty system prompt!" }
-            check(_readyForSystemPrompt) { "System prompt must be set ** RIGHT AFTER ** model loaded!" }
+            require(systemPrompt.isNotBlank()) { "Cannot process empty system prompt!" }
             check(_state.value is InferenceEngine.State.ModelReady) {
                 "Cannot process system prompt in ${_state.value.javaClass.simpleName}!"
             }
@@ -199,7 +201,7 @@ internal class InferenceEngineImpl private constructor(
             Log.i(TAG, "Sending system prompt...")
             _readyForSystemPrompt = false
             _state.value = InferenceEngine.State.ProcessingSystemPrompt
-            processSystemPrompt(prompt).let { result ->
+            processSystemPrompt(systemPrompt).let { result ->
                 if (result != 0) {
                     RuntimeException("Failed to process system prompt: $result").also {
                         _state.value = InferenceEngine.State.Error(it)
@@ -208,6 +210,25 @@ internal class InferenceEngineImpl private constructor(
                 }
             }
             Log.i(TAG, "System prompt processed! Awaiting user prompt...")
+            _state.value = InferenceEngine.State.ModelReady
+        }
+
+    override suspend fun resetToSystemPrompt() =
+        withContext(llamaDispatcher) {
+            check(_state.value is InferenceEngine.State.ModelReady) {
+                "Cannot reset prompt context in ${_state.value.javaClass.simpleName}!"
+            }
+
+            Log.i(TAG, "Restoring cached system prompt context...")
+            _state.value = InferenceEngine.State.ProcessingSystemPrompt
+            restoreSystemPromptContext().let { result ->
+                if (result != 0) {
+                    RuntimeException("Failed to restore system prompt context: $result").also {
+                        _state.value = InferenceEngine.State.Error(it)
+                        throw it
+                    }
+                }
+            }
             _state.value = InferenceEngine.State.ModelReady
         }
 
@@ -227,6 +248,7 @@ internal class InferenceEngineImpl private constructor(
             Log.i(TAG, "Sending user prompt...")
             _readyForSystemPrompt = false
             _state.value = InferenceEngine.State.ProcessingUserPrompt
+            _cancelGeneration = false
 
             processUserPrompt(message, predictLength).let { result ->
                 if (result != 0) {
@@ -258,6 +280,59 @@ internal class InferenceEngineImpl private constructor(
             throw e
         }
     }.flowOn(llamaDispatcher)
+
+    override suspend fun runPrompt(
+        message: String,
+        predictLength: Int,
+        onToken: suspend (String) -> Boolean,
+    ) = withContext(llamaDispatcher) {
+        require(message.isNotEmpty()) { "User prompt discarded due to being empty!" }
+        check(_state.value is InferenceEngine.State.ModelReady) {
+            "User prompt discarded due to: ${_state.value.javaClass.simpleName}"
+        }
+
+        try {
+            Log.i(TAG, "Sending user prompt...")
+            _readyForSystemPrompt = false
+            _state.value = InferenceEngine.State.ProcessingUserPrompt
+            _cancelGeneration = false
+
+            processUserPrompt(message, predictLength).let { result ->
+                if (result != 0) {
+                    Log.e(TAG, "Failed to process user prompt: $result")
+                    return@withContext
+                }
+            }
+
+            Log.i(TAG, "User prompt processed. Generating assistant prompt...")
+            _state.value = InferenceEngine.State.Generating
+            while (!_cancelGeneration) {
+                generateNextToken()?.let { utf8token ->
+                    if (utf8token.isNotEmpty() && !onToken(utf8token)) {
+                        _cancelGeneration = true
+                    }
+                } ?: break
+            }
+            if (_cancelGeneration) {
+                Log.i(TAG, "Assistant generation aborted per requested.")
+            } else {
+                Log.i(TAG, "Assistant generation complete. Awaiting user prompt...")
+            }
+            _state.value = InferenceEngine.State.ModelReady
+        } catch (e: CancellationException) {
+            Log.i(TAG, "Assistant generation cancelled.")
+            _state.value = InferenceEngine.State.ModelReady
+            throw e
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during generation!", e)
+            _state.value = InferenceEngine.State.Error(e)
+            throw e
+        }
+    }
+
+    override fun requestGenerationStop() {
+        _cancelGeneration = true
+    }
 
     /**
      * Benchmark the model
