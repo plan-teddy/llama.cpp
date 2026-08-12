@@ -5,7 +5,6 @@ import android.util.Log
 import com.arm.aichat.InferenceEngine
 import com.arm.aichat.UnsupportedArchitectureException
 import com.arm.aichat.internal.InferenceEngineImpl.Companion.getInstance
-import dalvik.annotation.optimization.FastNative
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -16,8 +15,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -79,37 +77,28 @@ internal class InferenceEngineImpl private constructor(
      * JNI methods
      * @see ai_chat.cpp
      */
-    @FastNative
     private external fun init(nativeLibDir: String)
 
-    @FastNative
     private external fun load(modelPath: String): Int
 
-    @FastNative
-    private external fun prepare(threadCount: Int): Int
+    private external fun prepare(
+        threadCount: Int,
+        contextSize: Int,
+        useQuantizedKvCache: Boolean,
+    ): Int
 
-    @FastNative
     private external fun systemInfo(): String
 
-    @FastNative
     private external fun benchModel(pp: Int, tg: Int, pl: Int, nr: Int): String
 
-    @FastNative
     private external fun processSystemPrompt(systemPrompt: String): Int
 
-    @FastNative
-    private external fun restoreSystemPromptContext(): Int
-
-    @FastNative
     private external fun processUserPrompt(userPrompt: String, predictLength: Int): Int
 
-    @FastNative
     private external fun generateNextToken(): String?
 
-    @FastNative
     private external fun unload()
 
-    @FastNative
     private external fun shutdown()
 
     private val _state =
@@ -150,7 +139,12 @@ internal class InferenceEngineImpl private constructor(
     /**
      * Load the LLM
      */
-    override suspend fun loadModel(pathToModel: String, threadCount: Int) =
+    override suspend fun loadModel(
+        pathToModel: String,
+        threadCount: Int,
+        contextSize: Int,
+        useQuantizedKvCache: Boolean,
+    ) =
         withContext(llamaDispatcher) {
             check(_state.value is InferenceEngine.State.Initialized) {
                 "Cannot load model in ${_state.value.javaClass.simpleName}!"
@@ -171,7 +165,7 @@ internal class InferenceEngineImpl private constructor(
                     // TODO-han.yin: find a better way to pass other error codes
                     if (it != 0) throw UnsupportedArchitectureException()
                 }
-                prepare(threadCount).let {
+                prepare(threadCount, contextSize, useQuantizedKvCache).let {
                     if (it != 0) throw IOException("Failed to prepare resources")
                 }
                 Log.i(TAG, "Model loaded!")
@@ -213,73 +207,18 @@ internal class InferenceEngineImpl private constructor(
             _state.value = InferenceEngine.State.ModelReady
         }
 
-    override suspend fun resetToSystemPrompt() =
-        withContext(llamaDispatcher) {
-            check(_state.value is InferenceEngine.State.ModelReady) {
-                "Cannot reset prompt context in ${_state.value.javaClass.simpleName}!"
-            }
-
-            Log.i(TAG, "Restoring cached system prompt context...")
-            _state.value = InferenceEngine.State.ProcessingSystemPrompt
-            restoreSystemPromptContext().let { result ->
-                if (result != 0) {
-                    RuntimeException("Failed to restore system prompt context: $result").also {
-                        _state.value = InferenceEngine.State.Error(it)
-                        throw it
-                    }
-                }
-            }
-            _state.value = InferenceEngine.State.ModelReady
-        }
-
     /**
      * Send plain text user prompt to LLM, which starts generating tokens in a [Flow]
      */
     override fun sendUserPrompt(
         message: String,
         predictLength: Int,
-    ): Flow<String> = flow {
-        require(message.isNotEmpty()) { "User prompt discarded due to being empty!" }
-        check(_state.value is InferenceEngine.State.ModelReady) {
-            "User prompt discarded due to: ${_state.value.javaClass.simpleName}"
+    ): Flow<String> = channelFlow {
+        runPrompt(message, predictLength) { token ->
+            send(token)
+            true
         }
-
-        try {
-            Log.i(TAG, "Sending user prompt...")
-            _readyForSystemPrompt = false
-            _state.value = InferenceEngine.State.ProcessingUserPrompt
-            _cancelGeneration = false
-
-            processUserPrompt(message, predictLength).let { result ->
-                if (result != 0) {
-                    Log.e(TAG, "Failed to process user prompt: $result")
-                    return@flow
-                }
-            }
-
-            Log.i(TAG, "User prompt processed. Generating assistant prompt...")
-            _state.value = InferenceEngine.State.Generating
-            while (!_cancelGeneration) {
-                generateNextToken()?.let { utf8token ->
-                    if (utf8token.isNotEmpty()) emit(utf8token)
-                } ?: break
-            }
-            if (_cancelGeneration) {
-                Log.i(TAG, "Assistant generation aborted per requested.")
-            } else {
-                Log.i(TAG, "Assistant generation complete. Awaiting user prompt...")
-            }
-            _state.value = InferenceEngine.State.ModelReady
-        } catch (e: CancellationException) {
-            Log.i(TAG, "Assistant generation's flow collection cancelled.")
-            _state.value = InferenceEngine.State.ModelReady
-            throw e
-        } catch (e: Exception) {
-            Log.e(TAG, "Error during generation!", e)
-            _state.value = InferenceEngine.State.Error(e)
-            throw e
-        }
-    }.flowOn(llamaDispatcher)
+    }
 
     override suspend fun runPrompt(
         message: String,
@@ -293,9 +232,9 @@ internal class InferenceEngineImpl private constructor(
 
         try {
             Log.i(TAG, "Sending user prompt...")
+            _cancelGeneration = false
             _readyForSystemPrompt = false
             _state.value = InferenceEngine.State.ProcessingUserPrompt
-            _cancelGeneration = false
 
             processUserPrompt(message, predictLength).let { result ->
                 if (result != 0) {
@@ -320,7 +259,7 @@ internal class InferenceEngineImpl private constructor(
             }
             _state.value = InferenceEngine.State.ModelReady
         } catch (e: CancellationException) {
-            Log.i(TAG, "Assistant generation cancelled.")
+            Log.i(TAG, "Assistant generation's flow collection cancelled.")
             _state.value = InferenceEngine.State.ModelReady
             throw e
         } catch (e: Exception) {

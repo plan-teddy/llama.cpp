@@ -18,17 +18,17 @@ interface InferenceEngine {
      *
      * @throws UnsupportedArchitectureException if model architecture not supported
      */
-    suspend fun loadModel(pathToModel: String, threadCount: Int = 0)
+    suspend fun loadModel(
+        pathToModel: String,
+        threadCount: Int = 0,
+        contextSize: Int = DEFAULT_CONTEXT_SIZE,
+        useQuantizedKvCache: Boolean = false,
+    )
 
     /**
      * Sends a system prompt to the loaded model
      */
     suspend fun setSystemPrompt(systemPrompt: String)
-
-    /**
-     * Drops user/assistant context while preserving the already processed system prompt.
-     */
-    suspend fun resetToSystemPrompt()
 
     /**
      * Sends a user prompt to the loaded model and returns a Flow of generated tokens.
@@ -87,9 +87,10 @@ interface InferenceEngine {
         data class Error(val exception: Exception) : State()
     }
 
-    companion object {
-        const val DEFAULT_PREDICT_LENGTH = 1024
-    }
+companion object {
+    const val DEFAULT_PREDICT_LENGTH = 1024
+    const val DEFAULT_CONTEXT_SIZE = 8192
+}
 }
 
 val State.isUninterruptible
