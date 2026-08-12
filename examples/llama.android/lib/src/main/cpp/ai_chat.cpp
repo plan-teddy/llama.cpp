@@ -29,15 +29,21 @@ constexpr int   N_THREADS_MAX           = 4;
 constexpr int   N_THREADS_HEADROOM      = 2;
 
 constexpr int   DEFAULT_CONTEXT_SIZE    = 8192;
+constexpr int   MIN_CONTEXT_SIZE        = 2048;
 constexpr int   OVERFLOW_HEADROOM       = 4;
 constexpr int   BATCH_SIZE              = 512;
 constexpr float DEFAULT_SAMPLER_TEMP    = 0.3f;
+// VRS: fixed seed so summarization is reproducible for the same prompt/context.
+// Makes retried/re-run chunks produce identical JSON (checkpoint reuse) and failures
+// reproducible. Temperature is unchanged, so output quality/distribution is unaffected.
+constexpr uint32_t VRS_SAMPLER_SEED     = 0x56525321u; // "VRS!"
 
 static llama_model                      * g_model;
 static llama_context                    * g_context;
 static llama_batch                        g_batch;
 static common_chat_templates_ptr          g_chat_templates;
 static common_sampler                   * g_sampler;
+static int                                g_context_size = DEFAULT_CONTEXT_SIZE;
 
 extern "C"
 JNIEXPORT void JNICALL
@@ -73,33 +79,77 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_load(JNIEnv *env, jobject, jstr
     return 0;
 }
 
-static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT_CONTEXT_SIZE) {
+static int resolve_thread_count(const int requested_thread_count) {
+    if (requested_thread_count > 0) {
+        return std::max(1, std::min(N_THREADS_MAX, requested_thread_count));
+    }
+    return std::max(N_THREADS_MIN, std::min(N_THREADS_MAX,
+                                            (int) sysconf(_SC_NPROCESSORS_ONLN) -
+                                            N_THREADS_HEADROOM));
+}
+
+static int resolve_context_size(const int requested_context_size, const int trained_context_size) {
+    const int requested = requested_context_size > 0 ? requested_context_size : DEFAULT_CONTEXT_SIZE;
+    const int bounded = std::max(MIN_CONTEXT_SIZE, requested);
+    if (trained_context_size > 0) {
+        return std::min(bounded, trained_context_size);
+    }
+    return bounded;
+}
+
+static int active_context_size() {
+    return g_context ? (int) llama_n_ctx(g_context) : g_context_size;
+}
+
+static int usable_context_limit() {
+    return active_context_size() - OVERFLOW_HEADROOM;
+}
+
+static llama_context *init_context(
+        llama_model *model,
+        const int n_ctx = DEFAULT_CONTEXT_SIZE,
+        const int requested_thread_count = 0,
+        const bool use_quantized_kv_cache = false) {
     if (!model) {
         LOGe("%s: model cannot be null", __func__);
         return nullptr;
     }
 
     // Multi-threading setup
-    const int n_threads = std::max(N_THREADS_MIN, std::min(N_THREADS_MAX,
-                                                     (int) sysconf(_SC_NPROCESSORS_ONLN) -
-                                                     N_THREADS_HEADROOM));
+    const int n_threads = resolve_thread_count(requested_thread_count);
     LOGi("%s: Using %d threads", __func__, n_threads);
 
     // Context parameters setup
     llama_context_params ctx_params = llama_context_default_params();
     const int trained_context_size = llama_model_n_ctx_train(model);
-    if (n_ctx > trained_context_size) {
-        LOGw("%s: Model was trained with only %d context size! Enforcing %d context size...",
-             __func__, trained_context_size, n_ctx);
+    const int resolved_context_size = resolve_context_size(n_ctx, trained_context_size);
+    if (resolved_context_size != n_ctx) {
+        LOGi("%s: context size resolved from %d to %d", __func__, n_ctx, resolved_context_size);
     }
-    ctx_params.n_ctx = n_ctx;
+    ctx_params.n_ctx = resolved_context_size;
     ctx_params.n_batch = BATCH_SIZE;
     ctx_params.n_ubatch = BATCH_SIZE;
     ctx_params.n_threads = n_threads;
     ctx_params.n_threads_batch = n_threads;
+    if (use_quantized_kv_cache) {
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+        ctx_params.type_k = GGML_TYPE_Q8_0;
+        ctx_params.type_v = GGML_TYPE_Q8_0;
+        LOGi("%s: Using Q8_0 KV cache with flash attention", __func__);
+    }
     auto *context = llama_init_from_model(g_model, ctx_params);
+    if (context == nullptr && use_quantized_kv_cache) {
+        LOGw("%s: Q8_0 KV cache context failed; retrying with default F16 KV cache", __func__);
+        ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        ctx_params.type_k = GGML_TYPE_F16;
+        ctx_params.type_v = GGML_TYPE_F16;
+        context = llama_init_from_model(g_model, ctx_params);
+    }
     if (context == nullptr) {
-        LOGe("%s: llama_new_context_with_model() returned null)", __func__);
+        LOGe("%s: llama_init_from_model() returned null", __func__);
+    } else {
+        g_context_size = (int) llama_n_ctx(context);
+        LOGi("%s: active context size = %d", __func__, g_context_size);
     }
     return context;
 }
@@ -107,13 +157,23 @@ static llama_context *init_context(llama_model *model, const int n_ctx = DEFAULT
 static common_sampler *new_sampler(float temp) {
     common_params_sampling sparams;
     sparams.temp = temp;
+    sparams.seed = VRS_SAMPLER_SEED;
     return common_sampler_init(g_model, sparams);
 }
 
 extern "C"
 JNIEXPORT jint JNICALL
-Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(JNIEnv * /*env*/, jobject /*unused*/) {
-    auto *context = init_context(g_model);
+Java_com_arm_aichat_internal_InferenceEngineImpl_prepare(
+        JNIEnv * /*env*/,
+        jobject /*unused*/,
+        jint requested_thread_count,
+        jint requested_context_size,
+        jboolean use_quantized_kv_cache) {
+    auto *context = init_context(
+            g_model,
+            requested_context_size,
+            requested_thread_count,
+            use_quantized_kv_cache == JNI_TRUE);
     if (!context) { return 1; }
     g_context = context;
     g_batch = llama_batch_init(BATCH_SIZE, 0, 1);
@@ -259,14 +319,21 @@ constexpr const char *ROLE_ASSISTANT    = "assistant";
 static std::vector<common_chat_msg> chat_msgs;
 static llama_pos system_prompt_position;
 static llama_pos current_position;
+static std::string cached_system_prompt_raw;
+static std::string cached_system_prompt_text;
+static bool cached_system_prompt_valid = false;
 
 static void reset_long_term_states(const bool clear_kv_cache = true) {
     chat_msgs.clear();
     system_prompt_position = 0;
     current_position = 0;
 
-    if (clear_kv_cache)
+    if (clear_kv_cache) {
         llama_memory_clear(llama_get_memory(g_context), false);
+        cached_system_prompt_raw.clear();
+        cached_system_prompt_text.clear();
+        cached_system_prompt_valid = false;
+    }
 }
 
 /**
@@ -311,6 +378,9 @@ static void reset_short_term_states() {
     stop_generation_position = 0;
     cached_token_chars.clear();
     assistant_ss.str("");
+    if (g_sampler) {
+        common_sampler_reset(g_sampler);
+    }
 }
 
 static int decode_tokens_in_batches(
@@ -327,7 +397,7 @@ static int decode_tokens_in_batches(
         LOGv("%s: Preparing a batch size of %d starting at: %d", __func__, cur_batch_size, i);
 
         // Shift context if current batch cannot fit into the context
-        if (start_pos + i + cur_batch_size >= DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
+        if (start_pos + i + cur_batch_size >= usable_context_limit()) {
             LOGw("%s: Current batch won't fit into context! Shifting...", __func__);
             shift_context();
         }
@@ -357,21 +427,37 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
         jobject /*unused*/,
         jstring jsystem_prompt
 ) {
-    // Reset long-term & short-term states
-    reset_long_term_states();
-    reset_short_term_states();
-
     // Obtain system prompt from JEnv
     const auto *system_prompt = env->GetStringUTFChars(jsystem_prompt, nullptr);
     LOGd("%s: System prompt received: \n%s", __func__, system_prompt);
-    std::string formatted_system_prompt(system_prompt);
+    std::string raw_system_prompt(system_prompt);
+    std::string formatted_system_prompt(raw_system_prompt);
 
     // Format system prompt if applicable
     const bool has_chat_template = common_chat_templates_was_explicit(g_chat_templates.get());
-    if (has_chat_template) {
-        formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, system_prompt);
+    if (cached_system_prompt_valid && cached_system_prompt_raw == raw_system_prompt) {
+        reset_short_term_states();
+        chat_msgs.clear();
+        if (has_chat_template) {
+            common_chat_msg cached_system_msg;
+            cached_system_msg.role = ROLE_SYSTEM;
+            cached_system_msg.content = raw_system_prompt;
+            chat_msgs.push_back(cached_system_msg);
+        }
+        llama_memory_seq_rm(llama_get_memory(g_context), 0, system_prompt_position, -1);
+        current_position = system_prompt_position;
+        LOGi("%s: Reusing cached system prompt KV prefix at position %d",
+             __func__, system_prompt_position);
+        env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
+        return 0;
+    } else {
+        reset_long_term_states();
+        if (has_chat_template) {
+            formatted_system_prompt = chat_add_and_format(ROLE_SYSTEM, system_prompt);
+        }
     }
     env->ReleaseStringUTFChars(jsystem_prompt, system_prompt);
+    reset_short_term_states();
 
     // Tokenize system prompt
     const auto system_tokens = common_tokenize(g_context, formatted_system_prompt,
@@ -381,7 +467,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
     }
 
     // Handle context overflow
-    const int max_batch_size = DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM;
+    const int max_batch_size = usable_context_limit();
     if ((int) system_tokens.size() > max_batch_size) {
         LOGe("%s: System prompt too long for context! %d tokens, max: %d",
              __func__, (int) system_tokens.size(), max_batch_size);
@@ -396,6 +482,9 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processSystemPrompt(
 
     // Update position
     system_prompt_position = current_position = (int) system_tokens.size();
+    cached_system_prompt_raw = raw_system_prompt;
+    cached_system_prompt_text = formatted_system_prompt;
+    cached_system_prompt_valid = true;
     return 0;
 }
 
@@ -429,13 +518,18 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Ensure user prompt doesn't exceed the context size by truncating if necessary.
-    const int user_prompt_size = (int) user_tokens.size();
-    const int max_batch_size = DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM;
-    if (user_prompt_size > max_batch_size) {
-        const int skipped_tokens = user_prompt_size - max_batch_size;
+    const int original_user_prompt_size = (int) user_tokens.size();
+    const int max_batch_size = usable_context_limit() - current_position;
+    if (max_batch_size <= 0) {
+        LOGe("%s: User prompt cannot fit into remaining context!", __func__);
+        return 1;
+    }
+    if (original_user_prompt_size > max_batch_size) {
+        const int skipped_tokens = original_user_prompt_size - max_batch_size;
         user_tokens.resize(max_batch_size);
         LOGw("%s: User prompt too long! Skipped %d tokens!", __func__, skipped_tokens);
     }
+    const int decoded_user_prompt_size = (int) user_tokens.size();
 
     // Decode user tokens in batches
     if (decode_tokens_in_batches(g_context, g_batch, user_tokens, current_position, true)) {
@@ -444,8 +538,8 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_processUserPrompt(
     }
 
     // Update position
-    current_position += user_prompt_size;
-    stop_generation_position = current_position + user_prompt_size + n_predict;
+    current_position += decoded_user_prompt_size;
+    stop_generation_position = current_position + n_predict;
     return 0;
 }
 
@@ -490,7 +584,7 @@ Java_com_arm_aichat_internal_InferenceEngineImpl_generateNextToken(
         jobject /*unused*/
 ) {
     // Infinite text generation via context shifting
-    if (current_position >= DEFAULT_CONTEXT_SIZE - OVERFLOW_HEADROOM) {
+    if (current_position >= usable_context_limit()) {
         LOGw("%s: Context full! Shifting...", __func__);
         shift_context();
     }
